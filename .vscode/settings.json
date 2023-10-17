@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "threadmgr.h": "c",
+        "debug.h": "c",
+        "sysmem.h": "c",
+        "modulemgr.h": "c"
+    }
+}
