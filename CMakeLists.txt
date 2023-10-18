@@ -17,9 +17,12 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
 
 add_executable(iostaging
   src/main.c
+  src/msif.c
+  src/sdif.c
 )
 
 target_link_libraries(iostaging
+  k
   taihenForKernel_stub
   taihenModuleUtils_stub
   SceCpuForDriver_stub
@@ -31,6 +34,7 @@ target_link_libraries(iostaging
   SceSysrootForKernel_stub
   SceProcessmgrForDriver_stub
   SceDmacmgrForDriver_stub
+  gcc
 )
 
 vita_create_self(iostaging.skprx iostaging CONFIG exports.yml UNSAFE)
