@@ -219,6 +219,20 @@ static int _FUN_81001C10(void *sdifContext, SdifCommand *primaryCmd, SdifCommand
     if ((ret = _SdifLock(sdifContext)) < 0)
         return ret;
 
+    /**
+     * Race condition fix. TaiHEN seems to install the hook before configuring the hookRef,
+     * so if the hooked function is hot, there may be a chance of the function getting
+     * executed before it is safe to call TAI_CONTINUE. Seems to only happen to this function.
+     */
+    {
+        static SceBool loaded = SCE_FALSE;
+        if (!loaded)
+        {
+            ksceKernelDelayThread(10);
+            loaded = SCE_TRUE;
+        }
+    }
+
     if (*(SceUInt32 *)(sdifContext + 0x2420) != 1) // SDIF device index. Must be the GC/SD slot (1)
     {
         _SdifUnlock(sdifContext);
