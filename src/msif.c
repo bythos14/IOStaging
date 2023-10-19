@@ -11,20 +11,25 @@
 typedef struct SceMsifAdmaDescriptor
 {
     SceUIntPtr addr;
-    struct SceMsifAdmaDescriptor *next;
+    SceUIntPtr next;
     uint16_t size;
     uint16_t attr;
 } SceMsifAdmaDescriptor;
 
-static SceBool doDmaBypass;
+typedef struct MsifStagingBuffer
+{
+    StagingBuffer head;
+    void *dmaBuf;
+    SceSize dmaSize;
+    SceBool dmaBypass;
+    SceMsifAdmaDescriptor *descArea;
+    SceUIntPtr descAreaPAddr;
+    uint32_t *alignSizes;
+} MsifStagingBuffer;
 
 static tai_hook_ref_t hookRefs[5];
 static SceUID hookIds[5];
-static void *buf;
-static SceSize bufLen;
-static uint32_t *unalignedSizes;
-static SceMsifAdmaDescriptor *descArea;
-static StagingContext stagingBuf;
+static MsifStagingBuffer stagingBuf;
 
 int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset, uintptr_t *addr);
 
@@ -70,27 +75,46 @@ static int _sceMsifWriteSector(SceUInt32 sector, void *base, SceUInt32 nSectors)
 
 static int _sceMsifPrepareDmaTable(void *base, SceSize len, SceBool write)
 {
-    buf = base;
-    bufLen = len;
-    doDmaBypass = SCE_TRUE;
+    SceMsifAdmaDescriptor *desc = stagingBuf.descArea;
+    SceUIntPtr dmaAddr = stagingBuf.head.paddr, descAddr = stagingBuf.descAreaPAddr;
+    SceSize dmaSize, descCount = 0;
 
-    descArea[0].addr = stagingBuf.paddr;
-    descArea[0].next = NULL;
-    descArea[0].size = len >> 2;
-    descArea[0].attr = 0x8000;
+    stagingBuf.dmaBuf = base;
+    stagingBuf.dmaSize = len;
+    stagingBuf.dmaBypass = SCE_TRUE;
 
-    if ((len & 0x3f) == 0)
-        descArea[0].attr |= 0x7; // 64 bytes aligned
-    else if ((len & 0x1f) == 0)
-        descArea[0].attr |= 0x5; // 32 bytes aligned
-    else if ((len & 0xf) == 0)
-        descArea[0].attr |= 0x3; // 16 bytes aligned
+    while (len != 0)
+    {
+        dmaSize = MIN(len, 0x40000);
 
-    ksceKernelCpuDcacheAndL2WritebackRange(descArea, sizeof(descArea[0]));
+        if (descCount != 0)
+            desc[descCount - 1].next = descAddr + (sizeof(SceMsifAdmaDescriptor) * descCount);
 
-    unalignedSizes[0] = 0;
-    unalignedSizes[1] = 0;
-    unalignedSizes[2] = 0;
+        desc[descCount].addr = dmaAddr;
+        desc[descCount].next = 0;
+        desc[descCount].size = dmaSize >> 2;
+        desc[descCount].attr = 0xC000;
+
+        if ((dmaSize & 0x3f) == 0)
+            desc[descCount].attr |= 0x7; // 64 bytes aligned
+        else if ((dmaSize & 0x1f) == 0)
+            desc[descCount].attr |= 0x5; // 32 bytes aligned
+        else if ((dmaSize & 0xf) == 0)
+            desc[descCount].attr |= 0x3; // 16 bytes aligned
+
+        dmaAddr += dmaSize;
+        len -= dmaSize;
+        descCount++;
+    }
+
+    if (descCount != 0)
+        desc[descCount - 1].attr &= ~0x4000;
+
+    ksceKernelCpuDcacheAndL2WritebackRange(desc, descCount * sizeof(SceMsifAdmaDescriptor));
+
+    stagingBuf.alignSizes[0] = 0;
+    stagingBuf.alignSizes[1] = 0;
+    stagingBuf.alignSizes[2] = 0;
 
     return 0;
 }
@@ -99,14 +123,11 @@ static int _msproal_read_sectors(void *pCtx, SceUInt32 sector, SceUInt32 count, 
 {
     int ret = TAI_CONTINUE(int, hookRefs[3], pCtx, sector, count, descriptorBase);
 
-    if (doDmaBypass && ret == 0)
+    if (stagingBuf.dmaBypass && ret == 0)
     {
-        if (bufLen < 4096) // Safe to assume standard memcpy will be faster for small copies due to DMA overhead
-            memcpy(buf, stagingBuf.base, bufLen);
-        else
-            ksceDmacMemcpy(buf, stagingBuf.base, bufLen);
+        CopyBuffer(stagingBuf.dmaBuf, stagingBuf.head.base, stagingBuf.dmaSize);
 
-        doDmaBypass = SCE_FALSE;
+        stagingBuf.dmaBypass = SCE_FALSE;
     }
 
     return ret;
@@ -114,18 +135,13 @@ static int _msproal_read_sectors(void *pCtx, SceUInt32 sector, SceUInt32 count, 
 
 static int _msproal_write_sectors(void *pCtx, SceUInt32 sector, SceUInt32 count, SceMsifAdmaDescriptor *descriptorBase)
 {
-    if (doDmaBypass)
-    {
-        if (bufLen < 4096)
-            memcpy(stagingBuf.base, buf, bufLen); // Safe to assume standard memcpy will be faster for small copies due to DMA overhead
-        else
-            ksceDmacMemcpy(stagingBuf.base, buf, bufLen);
-    }
+    if (stagingBuf.dmaBypass)
+        CopyBuffer(stagingBuf.head.base, stagingBuf.dmaBuf, stagingBuf.dmaSize);
 
     int ret = TAI_CONTINUE(int, hookRefs[4], pCtx, sector, count, descriptorBase);
 
-    if (ret == 0 && doDmaBypass)
-        doDmaBypass = SCE_FALSE;
+    if (ret == 0 && stagingBuf.dmaBypass)
+        stagingBuf.dmaBypass = SCE_FALSE;
 
     return ret;
 }
@@ -134,23 +150,12 @@ int InitMsifStaging()
 {
     SceMsifAdmaDescriptor **descAreaBase;
     tai_module_info_t moduleInfo = {0};
-    SceKernelAllocMemBlockKernelOpt opt = {0};
 
     moduleInfo.size = sizeof(moduleInfo);
     taiGetModuleInfoForKernel(KERNEL_PID, "SceMsif", &moduleInfo);
 
-    opt.size = sizeof(opt);
-    opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT;
-    stagingBuf.memBlock = ksceKernelAllocMemBlock("MsifStagingBuf", IO_BUFFER_BLOCK_TYPE, MSIF_BUFFER_SIZE, &opt);
-    if (stagingBuf.memBlock < 0)
-    {
-        ksceKernelPrintf("[MSIF_STAGING] - Failed to allocate staging buffer (0x%08X)\n", stagingBuf.memBlock);
+    if (InitStagingBuffer(&stagingBuf.head, MSIF_BUFFER_SIZE) < 0)
         return -1;
-    }
-
-    ksceKernelGetMemBlockBase(stagingBuf.memBlock, &stagingBuf.base);
-
-    ksceKernelVAtoPA(stagingBuf.base, &stagingBuf.paddr);
 
     hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceMsif", 0xB706084A, 0x58654AA3, _sceMsifReadSector);
     hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceMsif", 0xB706084A, 0x329035EF, _sceMsifWriteSector);
@@ -158,9 +163,11 @@ int InitMsifStaging()
     hookIds[3] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[3], moduleInfo.modid, 0, 0xDDC, 1, _msproal_read_sectors);
     hookIds[4] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[4], moduleInfo.modid, 0, 0x107C, 1, _msproal_write_sectors);
 
-    module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14E4, (uintptr_t *)&unalignedSizes);
+    module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14E4, (uintptr_t *)&stagingBuf.alignSizes);
     module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14F8, (uintptr_t *)&descAreaBase);
-    descArea = *descAreaBase;
+    stagingBuf.descArea = *descAreaBase;
+
+    ksceKernelVAtoPA(stagingBuf.descArea, &stagingBuf.descAreaPAddr);
 
     return 0;
 }

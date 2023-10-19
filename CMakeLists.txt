@@ -19,6 +19,7 @@ add_executable(iostaging
   src/main.c
   src/msif.c
   src/sdif.c
+  src/common.h
 )
 
 target_link_libraries(iostaging
