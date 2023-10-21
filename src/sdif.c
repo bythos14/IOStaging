@@ -1,7 +1,7 @@
 #include <psp2kern/kernel/cpu.h>
 #include <psp2kern/kernel/dmac.h>
 #include <psp2kern/kernel/modulemgr.h>
-#include <psp2kern/kernel/sysmem.h>
+#include <psp2kern/kernel/cpu.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/debug.h>
 #include <taihen.h>
@@ -65,8 +65,10 @@ static tai_hook_ref_t hookRefs[3];
 static SceUID hookIds[3];
 static SdifStagingBuffer stagingBuf;
 
-static int (*FUN_810017E8)(void *sdifContext, SdifCommand *primaryCmd, SdifCommand *secondaryCmd, SceUInt maxRetries, SceUInt unk);
+static int (*_sceSdifSendCmd)(void *sdifContext, SdifCommand *primaryCmd, SdifCommand *secondaryCmd, SceUInt maxRetries, SceUInt unk);
 static void (*FUN_81000084)();
+static SdifCommand *(*_sceSdifGetCommand)(void *sdifContext);
+static int (*_sceSdifSendACmd)(void *sdifContext, SdifCommand *cmd, SceUInt maxRetries);
 
 int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset, uintptr_t *addr);
 
@@ -86,15 +88,15 @@ static inline int _SdifUnlock(void *sdifContext)
     return ksceKernelUnlockFastMutex((SceKernelFastMutex *)(sdifContext + 0x2444));
 }
 
-static int _sceSdifReadSectorSd(void *sdifCtx, SceUInt32 sector, void *base, SceUInt32 nSectors)
+static int _sceSdReadSector(void *sdCtx, SceUInt32 sector, void *base, SceUInt32 nSectors)
 {
     if (nSectors <= (SDIF_BUFFER_SIZE >> 9))
-        return TAI_CONTINUE(int, hookRefs[0], sdifCtx, sector, base, nSectors);
+        return TAI_CONTINUE(int, hookRefs[0], sdCtx, sector, base, nSectors);
 
     int ret;
     while (nSectors != 0)
     {
-        ret = TAI_CONTINUE(int, hookRefs[0], sdifCtx, sector, base, MIN(nSectors, SDIF_BUFFER_SIZE >> 9));
+        ret = TAI_CONTINUE(int, hookRefs[0], sdCtx, sector, base, MIN(nSectors, SDIF_BUFFER_SIZE >> 9));
         if (ret != 0)
             break;
 
@@ -106,15 +108,15 @@ static int _sceSdifReadSectorSd(void *sdifCtx, SceUInt32 sector, void *base, Sce
     return ret;
 }
 
-static int _sceSdifWriteSectorSd(void *sdifCtx, SceUInt32 sector, void *base, SceUInt32 nSectors)
+static int _sceSdWriteSector(void *sdCtx, SceUInt32 sector, void *base, SceUInt32 nSectors)
 {
     if (nSectors <= (SDIF_BUFFER_SIZE >> 9))
-        return TAI_CONTINUE(int, hookRefs[1], sdifCtx, sector, base, nSectors);
+        return TAI_CONTINUE(int, hookRefs[1], sdCtx, sector, base, nSectors);
 
     int ret;
     while (nSectors != 0)
     {
-        ret = TAI_CONTINUE(int, hookRefs[1], sdifCtx, sector, base, MIN(nSectors, SDIF_BUFFER_SIZE >> 9));
+        ret = TAI_CONTINUE(int, hookRefs[1], sdCtx, sector, base, MIN(nSectors, SDIF_BUFFER_SIZE >> 9));
         if (ret != 0)
             break;
 
@@ -125,24 +127,51 @@ static int _sceSdifWriteSectorSd(void *sdifCtx, SceUInt32 sector, void *base, Sc
 
     return ret;
 }
-
-static int InitCommands(void *sdifContext, SdifCommand *primaryCmd, SdifCommand *secondaryCmd)
+static void PrepareAdmaTable(SdifCommand *cmd, int secondary)
 {
     SceSdifAdmaDescriptor *desc;
     SceUIntPtr dmaAddr;
     SceSize dmaSize, descCount;
 
+    cmd->flags &= (secondary ? 0x3fefffff : 0xffefffff);
+    cmd->unalignedHeadLength = 0;
+    cmd->unalignedTailLength = 0;
+    cmd->alignedLength = 0;
+    cmd->descAreaPhyAddr = cmd->defaultDescAreaPhyAddr;
+
+    desc = &cmd->defaultDescArea[0];
+    dmaAddr = stagingBuf.head.paddr;
+    if (secondary)
+        dmaAddr += stagingBuf.dmaSizes[0];
+    dmaSize = stagingBuf.dmaSizes[secondary];
+    descCount = 0;
+    while (dmaSize != 0)
+    {
+        desc[descCount].addr = dmaAddr;
+        desc[descCount].cmd = 0x21;
+        desc[descCount].size = MIN(dmaSize, 0x10000);
+        descCount++;
+        dmaAddr += MIN(dmaSize, 0x10000);
+        dmaSize -= MIN(dmaSize, 0x10000);
+    }
+    if (descCount != 0)
+        desc[descCount - 1].cmd |= 0x2;
+    ksceKernelDcacheCleanRange(desc, sizeof(SceSdifAdmaDescriptor) * descCount);
+}
+
+static int InitCommands(void *sdifContext, SdifCommand *primaryCmd, SdifCommand *secondaryCmd)
+{
     if (primaryCmd->flags & 0x400)
-        stagingBuf.dmaSizes[0] = primaryCmd->blockCount * primaryCmd->blockSize;
+        stagingBuf.dmaSizes[0] = MAX(1, primaryCmd->blockCount) * primaryCmd->blockSize;
     else
         stagingBuf.dmaSizes[0] = 0;
 
     if (secondaryCmd != NULL && secondaryCmd->flags & 0x400)
-        stagingBuf.dmaSizes[1] = secondaryCmd->blockCount * secondaryCmd->blockSize;
+        stagingBuf.dmaSizes[1] = MAX(1, primaryCmd->blockCount) * secondaryCmd->blockSize;
     else
         stagingBuf.dmaSizes[1] = 0;
 
-    if ((stagingBuf.dmaSizes[0] + stagingBuf.dmaSizes[1]) > SDIF_BUFFER_SIZE)
+    if ((stagingBuf.dmaSizes[0] + stagingBuf.dmaSizes[1]) > stagingBuf.head.size)
         return -1;
 
     primaryCmd->pContext = sdifContext;
@@ -152,27 +181,9 @@ static int InitCommands(void *sdifContext, SdifCommand *primaryCmd, SdifCommand 
 
     if (primaryCmd->flags & 0x400)
     {
-        primaryCmd->flags &= 0xffefffff;
-        primaryCmd->unalignedHeadLength = 0;
-        primaryCmd->unalignedTailLength = 0;
-        primaryCmd->alignedLength = 0;
-        primaryCmd->descAreaPhyAddr = primaryCmd->defaultDescAreaPhyAddr;
-
-        desc = &primaryCmd->defaultDescArea[0];
-        dmaAddr = stagingBuf.head.paddr;
-        dmaSize = stagingBuf.dmaSizes[0];
-        descCount = 0;
-        while (dmaSize != 0)
-        {
-            desc[descCount].addr = dmaAddr;
-            desc[descCount].cmd = 0x21;
-            desc[descCount].size = MIN(dmaSize, 0x10000);
-            descCount++;
-            dmaAddr += MIN(dmaSize, 0x10000);
-            dmaSize -= MIN(dmaSize, 0x10000);
-        }
-        desc[descCount - 1].cmd |= 0x2;
-        ksceKernelCpuDcacheAndL2WritebackRange(desc, sizeof(SceSdifAdmaDescriptor) * descCount);
+        if (stagingBuf.dmaSizes[0] == 0)
+            return -1;
+        PrepareAdmaTable(primaryCmd, 0);
     }
 
     if (secondaryCmd != 0)
@@ -185,36 +196,34 @@ static int InitCommands(void *sdifContext, SdifCommand *primaryCmd, SdifCommand 
 
         if (secondaryCmd->flags & 0x400)
         {
-            secondaryCmd->flags &= 0x3fefffff;
-            secondaryCmd->unalignedHeadLength = 0;
-            secondaryCmd->unalignedTailLength = 0;
-            secondaryCmd->alignedLength = 0;
-            secondaryCmd->descAreaPhyAddr = secondaryCmd->defaultDescAreaPhyAddr;
-
-            desc = &secondaryCmd->defaultDescArea[0];
-            dmaAddr = stagingBuf.head.paddr;
-            dmaSize = stagingBuf.dmaSizes[1];
-            descCount = 0;
-            while (dmaSize != 0)
-            {
-                desc[descCount].addr = dmaAddr;
-                desc[descCount].cmd = 0x21;
-                desc[descCount].size = MIN(dmaSize, 0x10000);
-                descCount++;
-                dmaAddr += MIN(dmaSize, 0x10000);
-                dmaSize -= MIN(dmaSize, 0x10000);
-            }
-            desc[descCount - 1].cmd |= 0x2;
-            ksceKernelCpuDcacheAndL2WritebackRange(desc, sizeof(SceSdifAdmaDescriptor) * descCount);
+            if (stagingBuf.dmaSizes[1] == 0)
+                return -1;
+            PrepareAdmaTable(secondaryCmd, 1);
         }
     }
 
     return 0;
 }
 
+static int ExecuteACMD23(void *sdifContext, SceSize blockCount)
+{
+    SdifCommand *cmd = _sceSdifGetCommand(sdifContext);
+    if (cmd != NULL)
+    {
+        cmd->size = sizeof(*cmd);
+        cmd->cmd = 23;
+        cmd->flags = 0x13;
+        cmd->argument = blockCount;
+        cmd->buffer = NULL;
+
+        return _sceSdifSendACmd(sdifContext, cmd, 3);
+    }
+    return 0;
+}
+
 static int _FUN_81001C10(void *sdifContext, SdifCommand *primaryCmd, SdifCommand *secondaryCmd, SceUInt maxRetries)
 {
-    int ret;
+    int ret, deviceIndex = *(SceInt32 *)(sdifContext + 0x2420), deviceType = *(SceInt32 *)(sdifContext + 0x2410);
 
     if ((ret = _SdifLock(sdifContext)) < 0)
         return ret;
@@ -233,7 +242,8 @@ static int _FUN_81001C10(void *sdifContext, SdifCommand *primaryCmd, SdifCommand
         }
     }
 
-    if (*(SceUInt32 *)(sdifContext + 0x2420) != 1) // SDIF device index. Must be the GC/SD slot (1)
+    // Only SD2VITA
+    if ((deviceIndex != 1) || (deviceType != 2))
     {
         _SdifUnlock(sdifContext);
         return TAI_CONTINUE(int, hookRefs[2], sdifContext, primaryCmd, secondaryCmd, maxRetries);
@@ -245,6 +255,11 @@ static int _FUN_81001C10(void *sdifContext, SdifCommand *primaryCmd, SdifCommand
         return TAI_CONTINUE(int, hookRefs[2], sdifContext, primaryCmd, secondaryCmd, maxRetries);
     }
 
+    if (primaryCmd->cmd == 25) // ACMD23 on multi-block writes for optimal performance
+    {
+        ExecuteACMD23(sdifContext, primaryCmd->blockCount);
+    }
+
     _SdifLock(sdifContext);
 
     if ((primaryCmd->flags & 0x600) == 0x600)
@@ -252,7 +267,7 @@ static int _FUN_81001C10(void *sdifContext, SdifCommand *primaryCmd, SdifCommand
     if ((secondaryCmd != NULL) && (secondaryCmd->flags & 0x600) == 0x600)
         CopyBuffer(stagingBuf.head.base + stagingBuf.dmaSizes[0], secondaryCmd->buffer, stagingBuf.dmaSizes[1]);
 
-    ret = FUN_810017E8(sdifContext, primaryCmd, secondaryCmd, maxRetries, 1);
+    ret = _sceSdifSendCmd(sdifContext, primaryCmd, secondaryCmd, maxRetries, 1);
     if (ret < 0)
     {
         _SdifUnlock(sdifContext);
@@ -278,11 +293,13 @@ int InitSdifStaging()
     if (InitStagingBuffer(&stagingBuf.head, SDIF_BUFFER_SIZE) < 0)
         return -1;
 
-    module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x17E9, (uintptr_t *)&FUN_810017E8);
+    module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x17E9, (uintptr_t *)&_sceSdifSendCmd);
+    module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x1CE1, (uintptr_t *)&_sceSdifSendACmd);
     module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x85, (uintptr_t *)&FUN_81000084);
+    module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x2E41, (uintptr_t *)&_sceSdifGetCommand);
 
-    hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceSdif", 0x96D306FA, 0xB9593652, _sceSdifReadSectorSd);
-    hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceSdif", 0x96D306FA, 0xE0781171, _sceSdifWriteSectorSd);
+    hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceSdif", 0x96D306FA, 0xB9593652, _sceSdReadSector);
+    hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceSdif", 0x96D306FA, 0xE0781171, _sceSdWriteSector);
     hookIds[2] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[2], moduleInfo.modid, 0, 0x1C10, 1, _FUN_81001C10);
 
     return 0;

@@ -8,9 +8,6 @@
 
 #include "common.h"
 
-// Set to 1 to enable overclocking the Memory Stick to 60MHz
-#define OVERCLOCK_MSIF (1)
-
 typedef struct SceMsifAdmaDescriptor
 {
     SceUIntPtr addr;
@@ -113,7 +110,7 @@ static int _sceMsifPrepareDmaTable(void *base, SceSize len, SceBool write)
     if (descCount != 0)
         desc[descCount - 1].attr &= ~0x4000;
 
-    ksceKernelCpuDcacheAndL2WritebackRange(desc, descCount * sizeof(SceMsifAdmaDescriptor));
+    ksceKernelDcacheCleanRange(desc, descCount * sizeof(SceMsifAdmaDescriptor));
 
     stagingBuf.alignSizes[0] = 0;
     stagingBuf.alignSizes[1] = 0;

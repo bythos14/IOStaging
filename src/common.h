@@ -7,9 +7,13 @@
 #include <string.h>
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define SDIF_BUFFER_SIZE (128 * 1024)
 #define MSIF_BUFFER_SIZE (128 * 1024)
+
+// Set to 1 to enable overclocking the Memory Stick to 60MHz
+#define OVERCLOCK_MSIF (1)
 
 #define IO_BUFFER_BLOCK_TYPE (SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_TMP_NC_RW)
 
