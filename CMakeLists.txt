@@ -23,18 +23,17 @@ add_executable(iostaging
 )
 
 target_link_libraries(iostaging
-  k
   taihenForKernel_stub
   taihenModuleUtils_stub
   SceCpuForDriver_stub
   SceSysclibForDriver_stub
   SceSysmemForDriver_stub
-  SceProcEventForDriver_stub
   SceThreadmgrForDriver_stub
   SceDebugForDriver_stub
   SceSysrootForKernel_stub
   SceProcessmgrForDriver_stub
   SceDmacmgrForDriver_stub
+  ScePervasiveForDriver_stub
   gcc
 )
 
