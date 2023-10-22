@@ -30,10 +30,9 @@ target_link_libraries(iostaging
   SceSysmemForDriver_stub
   SceThreadmgrForDriver_stub
   SceDebugForDriver_stub
-  SceSysrootForKernel_stub
-  SceProcessmgrForDriver_stub
   SceDmacmgrForDriver_stub
   ScePervasiveForDriver_stub
+  SceIofilemgrForDriver_stub
   gcc
 )
 

@@ -1,9 +1,6 @@
 #include <psp2kern/kernel/cpu.h>
-#include <psp2kern/kernel/dmac.h>
-#include <psp2kern/kernel/modulemgr.h>
-#include <psp2kern/kernel/cpu.h>
 #include <psp2kern/kernel/threadmgr.h>
-#include <psp2kern/kernel/debug.h>
+
 #include <taihen.h>
 
 #include "common.h"
@@ -290,8 +287,11 @@ int InitSdifStaging()
     moduleInfo.size = sizeof(moduleInfo);
     taiGetModuleInfoForKernel(KERNEL_PID, "SceSdif", &moduleInfo);
 
+    if (SDIF_BUFFER_SIZE == 0) // Buffering disabled
+        return 0;
+
     if (InitStagingBuffer(&stagingBuf.head, SDIF_BUFFER_SIZE) < 0)
-        return -1;
+        goto fail;
 
     module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x17E9, (uintptr_t *)&_sceSdifSendCmd);
     module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x1CE1, (uintptr_t *)&_sceSdifSendACmd);
@@ -299,8 +299,30 @@ int InitSdifStaging()
     module_get_offset(KERNEL_PID, moduleInfo.modid, 0, 0x2E41, (uintptr_t *)&_sceSdifGetCommand);
 
     hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceSdif", 0x96D306FA, 0xB9593652, _sceSdReadSector);
+    if (hookIds[0] < 0)
+        goto fail;
     hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceSdif", 0x96D306FA, 0xE0781171, _sceSdWriteSector);
+    if (hookIds[1] < 0)
+        goto fail;
     hookIds[2] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[2], moduleInfo.modid, 0, 0x1C10, 1, _FUN_81001C10);
+    if (hookIds[2] < 0)
+        goto fail;
 
     return 0;
+fail:
+    LOG("Failed to initialize SDIF I/O staging\n");
+    TermSdifStaging();
+    return -1;
+}
+
+void TermSdifStaging()
+{
+    if (hookIds[2] > 0)
+        taiHookReleaseForKernel(hookIds[2], hookRefs[2]);
+    if (hookIds[1] > 0)
+        taiHookReleaseForKernel(hookIds[1], hookRefs[1]);
+    if (hookIds[0] > 0)
+        taiHookReleaseForKernel(hookIds[0], hookRefs[0]);
+
+    TermStagingBuffer(&stagingBuf.head);
 }

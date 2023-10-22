@@ -1,9 +1,6 @@
 #include <psp2kern/kernel/cpu.h>
-#include <psp2kern/kernel/dmac.h>
-#include <psp2kern/kernel/modulemgr.h>
-#include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/threadmgr.h>
-#include <psp2kern/kernel/debug.h>
+
 #include <taihen.h>
 
 #include "common.h"
@@ -179,25 +176,71 @@ int InitMsifStaging()
     moduleInfo.size = sizeof(moduleInfo);
     taiGetModuleInfoForKernel(KERNEL_PID, "SceMsif", &moduleInfo);
 
-    if (InitStagingBuffer(&stagingBuf.head, MSIF_BUFFER_SIZE) < 0)
-        return -1;
+    if (MSIF_BUFFER_SIZE != 0) // Buffering enabled
+    {
+        if (InitStagingBuffer(&stagingBuf.head, MSIF_BUFFER_SIZE) < 0)
+            return -1;
 
-    hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceMsif", 0xB706084A, 0x58654AA3, _sceMsifReadSector);
-    hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceMsif", 0xB706084A, 0x329035EF, _sceMsifWriteSector);
-    hookIds[2] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[2], moduleInfo.modid, 0, 0x38F0, 1, _sceMsifPrepareDmaTable);
-    hookIds[3] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[3], moduleInfo.modid, 0, 0xDDC, 1, _msproal_read_sectors);
-    hookIds[4] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[4], moduleInfo.modid, 0, 0x107C, 1, _msproal_write_sectors);
-    hookIds[5] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[5], moduleInfo.modid, 0, 0x25C0, 1, SetMsifClock);
+        hookIds[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[0], "SceMsif", 0xB706084A, 0x58654AA3, _sceMsifReadSector);
+        if (hookIds[0] < 0)
+            goto fail;
+        hookIds[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hookRefs[1], "SceMsif", 0xB706084A, 0x329035EF, _sceMsifWriteSector);
+        if (hookIds[1] < 0)
+            goto fail;
+        hookIds[2] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[2], moduleInfo.modid, 0, 0x38F0, 1, _sceMsifPrepareDmaTable);
+        if (hookIds[2] < 0)
+            goto fail;
+        hookIds[3] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[3], moduleInfo.modid, 0, 0xDDC, 1, _msproal_read_sectors);
+        if (hookIds[3] < 0)
+            goto fail;
+        hookIds[4] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[4], moduleInfo.modid, 0, 0x107C, 1, _msproal_write_sectors);
+        if (hookIds[4] < 0)
+            goto fail;
 
-    module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14E4, (uintptr_t *)&stagingBuf.alignSizes);
-    module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14F8, (uintptr_t *)&descAreaBase);
-    stagingBuf.descArea = *descAreaBase;
+        if (module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14E4, (uintptr_t *)&stagingBuf.alignSizes) < 0)
+            goto fail;
+        if (module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x14F8, (uintptr_t *)&descAreaBase) < 0)
+            goto fail;
 
-    ksceKernelVAtoPA(stagingBuf.descArea, &stagingBuf.descAreaPAddr);
+        stagingBuf.descArea = *descAreaBase;
 
-    module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x0, (uintptr_t *)&msifContext);
-    if ((*msifContext != NULL) && (*(SceUInt32 *)(*msifContext + 0xC0C) & 0x1)) // Check to see if memory stick is inserted and mounted already
-        kscePervasiveMsifSetClock(6);
+        if (ksceKernelVAtoPA(stagingBuf.descArea, &stagingBuf.descAreaPAddr) < 0)
+            goto fail;
+    }
+
+    if (OVERCLOCK_MSIF)
+    {
+        hookIds[5] = taiHookFunctionOffsetForKernel(KERNEL_PID, &hookRefs[5], moduleInfo.modid, 0, 0x25C0, 1, SetMsifClock);
+        if (hookIds[5] < 0)
+            goto fail;
+
+        if (module_get_offset(KERNEL_PID, moduleInfo.modid, 1, 0x0, (uintptr_t *)&msifContext) < 0)
+            goto fail;
+        if ((*msifContext != NULL) && (*(SceUInt32 *)(*msifContext + 0xC0C) & 0x1)) // Check to see if memory stick is inserted and mounted already
+            kscePervasiveMsifSetClock(6);
+    }
 
     return 0;
+fail:
+    LOG("Failed to initialize MSIF I/O staging\n");
+    TermMsifStaging();
+    return -1;
+}
+
+void TermMsifStaging()
+{
+    if (hookIds[5] > 0)
+        taiHookReleaseForKernel(hookIds[5], hookRefs[5]);
+    if (hookIds[4] > 0)
+        taiHookReleaseForKernel(hookIds[4], hookRefs[4]);
+    if (hookIds[3] > 0)
+        taiHookReleaseForKernel(hookIds[3], hookRefs[3]);
+    if (hookIds[2] > 0)
+        taiHookReleaseForKernel(hookIds[2], hookRefs[2]);
+    if (hookIds[1] > 0)
+        taiHookReleaseForKernel(hookIds[1], hookRefs[1]);
+    if (hookIds[0] > 0)
+        taiHookReleaseForKernel(hookIds[0], hookRefs[0]);
+
+    TermStagingBuffer(&stagingBuf.head);
 }
